@@ -17,6 +17,8 @@
 #include "hip_apex.h"
 namespace hip {
 
+hipError_t ihipMallocManaged(void** ptr, size_t size, size_t align, bool use_host_ptr);
+
 // Guards global hipArray set
 amd::Monitor hipArraySetLock{};
 std::unordered_set<hipArray*> hipArraySet;
@@ -854,6 +856,16 @@ hipError_t hipExtMallocWithFlags(void** ptr, size_t sizeBytes, unsigned int flag
 hipError_t hipMalloc(void** ptr, size_t sizeBytes) {
   HIP_INIT_API(hipMalloc, ptr, sizeBytes);
   CHECK_STREAM_CAPTURE_SUPPORTED();
+  if (apex::should_redirect_malloc(sizeBytes)) {
+    hipError_t status = ihipMallocManaged(ptr, sizeBytes, 0, false);
+    if (status == hipSuccess) {
+      HIP_RETURN_DURATION(status, ReturnPtrValue(ptr));
+    }
+    // Preserve hipMalloc semantics if managed allocation is unavailable or fails.
+    if (ptr != nullptr) {
+      *ptr = nullptr;
+    }
+  }
   HIP_RETURN_DURATION(ihipMalloc(ptr, sizeBytes, 0), ReturnPtrValue(ptr));
 }
 

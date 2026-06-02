@@ -24,6 +24,8 @@ namespace apex {
 
 static std::atomic<int> g_enabled{-1};  // -1 = not checked, 0 = off, 1 = on
 static std::atomic<int> g_debug{-1};
+static std::atomic<int> g_managed_malloc_redirect{-1};
+static std::atomic<uint64_t> g_managed_malloc_min_bytes{UINT64_MAX};
 
 struct Allocation {
     void* ptr;
@@ -72,6 +74,55 @@ bool enabled() {
         }
     }
     return e == 1;
+}
+
+bool managed_malloc_redirect_enabled() {
+    if (!enabled()) return false;
+
+    int e = g_managed_malloc_redirect.load(std::memory_order_relaxed);
+    if (e < 0) {
+        const char* env = getenv("APEX_MANAGED_MALLOC");
+        e = (env && env[0] == '1') ? 1 : 0;
+        g_managed_malloc_redirect.store(e, std::memory_order_relaxed);
+        if (e) {
+            fprintf(stderr, "[APEX] hipMalloc -> hipMallocManaged redirect enabled\n");
+        }
+    }
+    return e == 1;
+}
+
+static uint64_t parse_env_u64(const char* name, uint64_t default_value) {
+    const char* env = getenv(name);
+    if (!env || env[0] == '\0') {
+        return default_value;
+    }
+
+    char* end = nullptr;
+    unsigned long long parsed = strtoull(env, &end, 0);
+    if (end == env || (end && end[0] != '\0')) {
+        return default_value;
+    }
+    return static_cast<uint64_t>(parsed);
+}
+
+static uint64_t managed_malloc_min_bytes() {
+    uint64_t cached = g_managed_malloc_min_bytes.load(std::memory_order_relaxed);
+    if (cached != UINT64_MAX) {
+        return cached;
+    }
+
+    uint64_t min_bytes = parse_env_u64("APEX_MANAGED_MALLOC_MIN_MB", 0) * 1024ull * 1024ull;
+    min_bytes = parse_env_u64("APEX_MANAGED_MALLOC_MIN_BYTES", min_bytes);
+    g_managed_malloc_min_bytes.store(min_bytes, std::memory_order_relaxed);
+    if (min_bytes && debug_enabled()) {
+        fprintf(stderr, "[APEX] hipMalloc managed redirect min size=%llu bytes\n",
+                static_cast<unsigned long long>(min_bytes));
+    }
+    return min_bytes;
+}
+
+bool should_redirect_malloc(size_t size) {
+    return managed_malloc_redirect_enabled() && size >= managed_malloc_min_bytes();
 }
 
 void track_alloc(void* ptr, size_t size, unsigned int flags, bool managed) {

@@ -20,6 +20,10 @@ namespace apex {
 // Check if APEX GPU integration is enabled (cached env var check)
 bool enabled();
 
+// Check if plain hipMalloc should be redirected to managed memory.
+bool managed_malloc_redirect_enabled();
+bool should_redirect_malloc(size_t size);
+
 // Allocation tracking — called from ihipMalloc/ihipFree/ihipMallocManaged
 void track_alloc(void* ptr, size_t size, unsigned int flags, bool managed);
 void track_free(void* ptr);
