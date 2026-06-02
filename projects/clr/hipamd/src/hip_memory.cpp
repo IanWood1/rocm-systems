@@ -157,8 +157,6 @@ hipError_t ihipFree(void* ptr) {
     return hipSuccess;
   }
 
-  if (apex::enabled()) apex::track_free(ptr);
-
   size_t offset = 0;
   amd::Memory* memory_object = getMemoryObject(ptr, offset);
   if (memory_object != nullptr) {
@@ -177,6 +175,7 @@ hipError_t ihipFree(void* ptr) {
         amd::SvmBuffer::free(memory_object->getContext(), ptr);
       }
     }
+    if (apex::enabled()) apex::track_free(ptr);
     return hipSuccess;
   }
   return hipErrorInvalidValue;
@@ -856,8 +855,8 @@ hipError_t hipExtMallocWithFlags(void** ptr, size_t sizeBytes, unsigned int flag
 hipError_t hipMalloc(void** ptr, size_t sizeBytes) {
   HIP_INIT_API(hipMalloc, ptr, sizeBytes);
   CHECK_STREAM_CAPTURE_SUPPORTED();
-  if (apex::should_redirect_malloc(sizeBytes)) {
-    hipError_t status = ihipMallocManaged(ptr, sizeBytes, 0, false);
+  if (apex::managed_malloc_redirect_enabled()) {
+    hipError_t status = apex::try_redirected_managed_malloc(ptr, sizeBytes);
     if (status == hipSuccess) {
       HIP_RETURN_DURATION(status, ReturnPtrValue(ptr));
     }

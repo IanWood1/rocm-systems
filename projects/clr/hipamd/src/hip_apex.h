@@ -12,6 +12,7 @@
 #ifndef HIP_SRC_HIP_APEX_H
 #define HIP_SRC_HIP_APEX_H
 
+#include <hip/hip_runtime_api.h>
 #include <cstddef>
 #include <cstdint>
 
@@ -23,6 +24,7 @@ bool enabled();
 // Check if plain hipMalloc should be redirected to managed memory.
 bool managed_malloc_redirect_enabled();
 bool should_redirect_malloc(size_t size);
+hipError_t try_redirected_managed_malloc(void** ptr, size_t size);
 
 // Allocation tracking — called from ihipMalloc/ihipFree/ihipMallocManaged
 void track_alloc(void* ptr, size_t size, unsigned int flags, bool managed);
