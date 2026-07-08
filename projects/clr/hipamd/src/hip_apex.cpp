@@ -21,6 +21,7 @@
 #include <cstdio>
 
 namespace hip {
+hipError_t ihipMalloc(void** ptr, size_t sizeBytes, unsigned int flags);
 hipError_t ihipMallocManaged(void** ptr, size_t size, size_t align, bool use_host_ptr);
 hipError_t ihipMemPrefetchAsync(const void* dev_ptr, size_t count, hipMemLocation location,
                                 hipStream_t stream);
@@ -54,6 +55,7 @@ static std::atomic<int> g_managed_malloc_redirect{-1};
 static std::atomic<uint64_t> g_managed_malloc_min_bytes{UINT64_MAX};
 static std::atomic<int> g_prefetch_enabled{-1};
 static std::atomic<bool> g_prefetch_logged{false};
+static std::atomic<int> g_device_first_malloc{-1};
 
 struct Allocation {
     void* ptr;
@@ -177,6 +179,24 @@ static bool prefetch_enabled() {
     return e == 1;
 }
 
+static bool device_first_malloc_enabled() {
+    if (!enabled()) return false;
+
+    int e = g_device_first_malloc.load(std::memory_order_relaxed);
+    if (e < 0) {
+        const char* policy = getenv("APEX_ALLOC_POLICY");
+        const char* legacy = getenv("APEX_DEVICE_FIRST_MALLOC");
+        e = ((policy && (strcmp(policy, "device_first") == 0 ||
+                         strcmp(policy, "device_first_managed_fallback") == 0)) ||
+             (legacy && legacy[0] == '1')) ? 1 : 0;
+        g_device_first_malloc.store(e, std::memory_order_relaxed);
+        if (e) {
+            fprintf(stderr, "[APEX] allocation policy: device-first managed fallback\n");
+        }
+    }
+    return e == 1;
+}
+
 static bool parse_hbm_limit_gb(const char* env, uint64_t* limit_bytes) {
     if (!env || env[0] == '\0' || env[0] == '-') return false;
 
@@ -268,6 +288,11 @@ struct PrefetchResult {
     hipError_t status = hipErrorInvalidValue;
 };
 
+struct DeviceFirstMallocResult {
+    hipError_t status = hipErrorNotSupported;
+    bool suppress_managed_prefetch = false;
+};
+
 static PrefetchResult maybe_prefetch_redirected_alloc(void* ptr, size_t size) {
     PrefetchResult result;
     int device = hip::ihipGetDevice();
@@ -337,9 +362,72 @@ static void update_alloc_prefetch(void* ptr, int device, size_t prefetched) {
     }
 }
 
+static DeviceFirstMallocResult try_device_first_malloc(void** ptr, size_t size) {
+    DeviceFirstMallocResult result;
+    if (!device_first_malloc_enabled()) {
+        return result;
+    }
+
+    int device = hip::ihipGetDevice();
+    if (device < 0) device = 0;
+
+    const HbmPrefetchConfig& config = hbm_prefetch_config();
+    if (config.disable_all) {
+        if (debug_enabled()) {
+            fprintf(stderr, "[APEX] device-first malloc disabled by APEX_HBM_LIMIT_GB=0 size=%lluMB\n",
+                    static_cast<unsigned long long>(size / kMiB));
+        }
+        return result;
+    }
+
+    uint64_t previous_total = 0;
+    size_t reserved = reserve_prefetch_budget(device, size, config.limit_bytes, &previous_total);
+    if (reserved < size) {
+        if (reserved) {
+            release_prefetch_budget(device, reserved);
+        }
+        if (debug_enabled()) {
+            fprintf(stderr, "[APEX] device-first budget skip size=%zuMB reserved=%zuMB device=%d previous=%lluMB\n",
+                    size / kMiB, reserved / kMiB, device,
+                    static_cast<unsigned long long>(previous_total / kMiB));
+        }
+        return result;
+    }
+
+    hipError_t status = hip::ihipMalloc(ptr, size, 0);
+    if (status != hipSuccess || ptr == nullptr || *ptr == nullptr) {
+        release_prefetch_budget(device, reserved);
+        if (ptr != nullptr) {
+            *ptr = nullptr;
+        }
+        if (debug_enabled()) {
+            fprintf(stderr, "[APEX] device-first malloc failed size=%zuMB device=%d previous=%lluMB status=%d\n",
+                    size / kMiB, device,
+                    static_cast<unsigned long long>(previous_total / kMiB), status);
+        }
+        result.status = status;
+        result.suppress_managed_prefetch = true;
+        return result;
+    }
+
+    update_alloc_prefetch(*ptr, device, reserved);
+    if (debug_enabled()) {
+        fprintf(stderr, "[APEX] hipMalloc(%zuMB) -> device-first %p device=%d previous=%lluMB\n",
+                size / kMiB, *ptr, device,
+                static_cast<unsigned long long>(previous_total / kMiB));
+    }
+    result.status = hipSuccess;
+    return result;
+}
+
 hipError_t try_redirected_managed_malloc(void** ptr, size_t size) {
     if (!should_redirect_malloc(size)) {
         return hipErrorNotSupported;
+    }
+
+    DeviceFirstMallocResult device_result = try_device_first_malloc(ptr, size);
+    if (device_result.status == hipSuccess) {
+        return device_result.status;
     }
 
     hipError_t status = hip::ihipMallocManaged(ptr, size, 0, false);
@@ -351,11 +439,15 @@ hipError_t try_redirected_managed_malloc(void** ptr, size_t size) {
         return status;
     }
 
-    if (prefetch_enabled()) {
+    if (prefetch_enabled() && !device_result.suppress_managed_prefetch) {
         PrefetchResult prefetch = maybe_prefetch_redirected_alloc(*ptr, size);
         if (prefetch.prefetched_bytes) {
             update_alloc_prefetch(*ptr, prefetch.device, prefetch.prefetched_bytes);
         }
+    } else if (device_result.suppress_managed_prefetch && debug_enabled()) {
+        fprintf(stderr,
+                "[APEX] managed redirect suppress allocation prefetch after device-first failure ptr=%p size=%zuMB\n",
+                *ptr, size / kMiB);
     }
 
     if (debug_enabled()) {
