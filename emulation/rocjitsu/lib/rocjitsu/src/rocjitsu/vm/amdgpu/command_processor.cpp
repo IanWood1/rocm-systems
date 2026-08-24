@@ -21,6 +21,7 @@ RJ_DIAGNOSTIC_POP
 #include "util/log.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cassert>
@@ -34,6 +35,7 @@ RJ_DIAGNOSTIC_POP
 #include <string>
 #include <sys/mman.h>
 #include <thread>
+#include <vector>
 
 namespace rocjitsu {
 namespace amdgpu {
@@ -1234,6 +1236,92 @@ CommandProcessor::cluster_lds_targets(uint32_t dispatch_id, uint32_t wg_id, uint
   return targets;
 }
 
+CommandProcessor::DispatchFastPathResult
+CommandProcessor::try_complete_rocclr_blit_fast_path(DispatchEntry &entry) {
+  if (entry.kernel_name != "__amd_rocclr_copyBuffer")
+    return DispatchFastPathResult::NotApplicable;
+  if (!memory_ || entry.total_wgs == 0 || entry.kernarg_addr == 0)
+    return DispatchFastPathResult::NotApplicable;
+
+  constexpr size_t kCopyBufferKernargBytes = 48;
+  constexpr size_t kCopyChunkBytes = 1 << 20;
+
+  auto range_fits = [](uint64_t addr, uint64_t bytes) {
+    return bytes == 0 || bytes - 1 <= std::numeric_limits<uint64_t>::max() - addr;
+  };
+  auto range_known = [&](uint64_t addr, uint64_t bytes) {
+    if (!range_fits(addr, bytes) || bytes > std::numeric_limits<size_t>::max())
+      return false;
+    if (bytes == 0)
+      return true;
+    const auto size = static_cast<size_t>(bytes);
+    return memory_->resolve_host_ptr(addr, entry.process_id, size) != nullptr ||
+           memory_->has_range_mapping(addr, size, entry.process_id) ||
+           memory_->has_client_memory_range(addr, size, entry.process_id);
+  };
+
+  if (entry.kernarg_size != 0 && entry.kernarg_size < kCopyBufferKernargBytes)
+    return DispatchFastPathResult::NotApplicable;
+  if (!range_known(entry.kernarg_addr, kCopyBufferKernargBytes))
+    return DispatchFastPathResult::Deferred;
+
+  std::array<uint8_t, kCopyBufferKernargBytes> kernarg{};
+  memory_->read_block(entry.kernarg_addr, std::span<uint8_t>(kernarg.data(), kernarg.size()),
+                      entry.process_id);
+  auto read_u64_arg = [&](size_t offset) {
+    uint64_t value = 0;
+    std::memcpy(&value, kernarg.data() + offset, sizeof(value));
+    return value;
+  };
+
+  const uint64_t src = read_u64_arg(0);
+  const uint64_t dst = read_u64_arg(8);
+  const uint64_t bytes = read_u64_arg(16);
+
+  if (!range_known(src, bytes) || !range_known(dst, bytes))
+    return DispatchFastPathResult::Deferred;
+
+  if (!entry.execution_begun) {
+    entry.execution_begun = true;
+    plugin_group_->onAmdgpuDispatchExecutionBegin(entry.dispatch_id);
+  }
+
+  if (bytes != 0 && src != dst) {
+    flush_gpu_caches();
+    std::vector<uint8_t> scratch(std::min<uint64_t>(kCopyChunkBytes, bytes));
+    const bool overlapping =
+        src < dst && bytes - 1 <= std::numeric_limits<uint64_t>::max() - src &&
+        dst <= src + bytes - 1;
+    if (overlapping) {
+      uint64_t remaining = bytes;
+      while (remaining > 0) {
+        const auto chunk = static_cast<size_t>(
+            std::min<uint64_t>(static_cast<uint64_t>(scratch.size()), remaining));
+        remaining -= chunk;
+        memory_->read_block(src + remaining, std::span<uint8_t>(scratch.data(), chunk),
+                            entry.process_id);
+        memory_->write_block(dst + remaining, std::span<const uint8_t>(scratch.data(), chunk),
+                             entry.process_id);
+      }
+    } else {
+      uint64_t offset = 0;
+      while (offset < bytes) {
+        const auto chunk = static_cast<size_t>(std::min<uint64_t>(
+            static_cast<uint64_t>(scratch.size()), bytes - offset));
+        memory_->read_block(src + offset, std::span<uint8_t>(scratch.data(), chunk),
+                            entry.process_id);
+        memory_->write_block(dst + offset, std::span<const uint8_t>(scratch.data(), chunk),
+                             entry.process_id);
+        offset += chunk;
+      }
+    }
+  }
+
+  entry.dispatched_wgs = entry.total_wgs;
+  entry.completed_wgs = entry.total_wgs;
+  return DispatchFastPathResult::Completed;
+}
+
 uint32_t CommandProcessor::dispatch_workgroups(DispatchEntry &entry) {
   assert(!cus_.empty() && "command processor has no compute units");
 
@@ -1523,6 +1611,17 @@ void CommandProcessor::on_cu_idle() {
       if (entry.barrier_bit && !barrier_satisfied(qs, qs.next_dispatch_idx))
         continue;
       if (!entry.is_non_kernel() && !entry.fully_dispatched()) {
+        auto fast_path = try_complete_rocclr_blit_fast_path(entry);
+        if (fast_path == DispatchFastPathResult::Completed) {
+          ++qs.next_dispatch_idx;
+          if (completion_)
+            completion_->drain_completions(new_queue_states_);
+          continue;
+        }
+        if (fast_path == DispatchFastPathResult::Deferred) {
+          arm_stall_recheck(engine()->context(partition_id()).current_tick());
+          continue;
+        }
         uint32_t sent = dispatch_workgroups(entry);
         if (sent > 0 && entry.fully_dispatched())
           ++qs.next_dispatch_idx;
@@ -1557,6 +1656,18 @@ void CommandProcessor::process_queues() {
         entry.completed_wgs = entry.total_wgs; // 0 == 0, immediately complete.
         ++qs.next_dispatch_idx;
         continue;
+      }
+
+      auto fast_path = try_complete_rocclr_blit_fast_path(entry);
+      if (fast_path == DispatchFastPathResult::Completed) {
+        ++qs.next_dispatch_idx;
+        if (completion_)
+          completion_->drain_completions(new_queue_states_);
+        continue;
+      }
+      if (fast_path == DispatchFastPathResult::Deferred) {
+        arm_stall_recheck(engine()->context(partition_id()).current_tick());
+        break;
       }
 
       uint32_t sent = dispatch_workgroups(entry);
@@ -1792,6 +1903,7 @@ void CommandProcessor::process_aql_packet(const hsa_kernel_dispatch_packet_t &pk
   }
   dp.code_load_bias = code_load_bias;
   std::string kernel_name = kernel_display_name(kernel_symbol);
+  dp.kernel_name = kernel_name;
   ++total_dispatched_;
 
   KernelDispatchInfo dispatch_info{};
@@ -2251,6 +2363,20 @@ void CommandProcessor::handle_doorbell(simdojo::Tick now) {
           auto &cur = qs.entries[qs.next_dispatch_idx];
           if (cur.dispatch_id != dispatch_id)
             break;
+
+          auto fast_path = try_complete_rocclr_blit_fast_path(cur);
+          if (fast_path == DispatchFastPathResult::Completed) {
+            ++qs.next_dispatch_idx;
+            progress = true;
+            if (completion_)
+              completion_->drain_completions(new_queue_states_);
+            continue;
+          }
+          if (fast_path == DispatchFastPathResult::Deferred) {
+            arm_stall_recheck(now);
+            backpressure = true;
+            break;
+          }
 
           uint32_t sent = dispatch_workgroups(cur);
           if (sent > 0)

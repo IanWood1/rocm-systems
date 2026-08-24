@@ -17,6 +17,7 @@
 #include <cassert>
 #include <cstdint>
 #include <deque>
+#include <string>
 
 namespace rocjitsu {
 namespace amdgpu {
@@ -68,6 +69,7 @@ struct DispatchEntry {
   uint32_t aql_packet_id = 0;
 
   uint64_t kernel_entry_pc = 0;
+  std::string kernel_name;
   uint64_t code_load_bias = 0;
   uint32_t wfs_per_workgroup = 1;
   uint32_t sgprs_per_wf = 104;

@@ -261,6 +261,12 @@ public:
   }
 
 private:
+  enum class DispatchFastPathResult {
+    NotApplicable,
+    Completed,
+    Deferred,
+  };
+
   struct ClusterWorkgroupPlacement;
   struct ClusterBarrierState;
 
@@ -318,6 +324,7 @@ private:
   read_kernel_descriptor(uint64_t kernel_object, uint32_t vmid, bool host_accessible = false);
   /// @brief Dispatch workgroups from entry to CUs. Returns number dispatched.
   uint32_t dispatch_workgroups(DispatchEntry &entry);
+  DispatchFastPathResult try_complete_rocclr_blit_fast_path(DispatchEntry &entry);
 
   void register_cluster_workgroup(const DispatchEntry &entry, uint32_t local_wg_id,
                                   uint32_t global_wg_id, ComputeUnitCore *cu, uint32_t lds_base);
