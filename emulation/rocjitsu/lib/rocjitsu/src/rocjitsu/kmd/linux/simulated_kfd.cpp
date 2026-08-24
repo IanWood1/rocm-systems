@@ -1777,14 +1777,20 @@ int SimulatedKfd::get_available_memory_ioctl(void *arg) {
 
 int SimulatedKfd::get_available_memory_ioctl(KfdProcess &proc, void *arg) {
   auto *args = static_cast<kfd_ioctl_get_available_memory_args *>(arg);
+  uint64_t local_mem_size = 0;
+  const uint32_t ord = gpu_ordinal(args->gpu_id);
+  if (ord < gpu_infos_.size())
+    local_mem_size = gpu_infos_[ord].local_mem_size;
+  if (local_mem_size == 0)
+    return -EINVAL;
+
   uint64_t allocated = 0;
   {
     std::lock_guard<std::mutex> lk(proc.alloc_mutex_);
     for (auto &[handle, alloc] : proc.allocations_)
       allocated += alloc.size;
   }
-  constexpr uint64_t kVramBytes = 64ULL << 30;
-  args->available = kVramBytes - std::min(allocated, kVramBytes);
+  args->available = local_mem_size - std::min(allocated, local_mem_size);
   return 0;
 }
 

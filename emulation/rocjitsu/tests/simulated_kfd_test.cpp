@@ -97,6 +97,36 @@ TEST_F(SimulatedKfdTest, OpenAndClose) {
   EXPECT_EQ(ret, 0);
 }
 
+TEST_F(SimulatedKfdTest, AvailableMemoryTracksConfiguredLocalMemory) {
+  auto t = create_test_vm();
+  ASSERT_NE(t.driver(), nullptr);
+  auto *drv = t.driver();
+
+  ASSERT_GE(drv->open(), 0);
+
+  kfd_ioctl_get_available_memory_args available{};
+  available.gpu_id = drv->gpu_id();
+  ASSERT_EQ(drv->ioctl(AMDKFD_IOC_AVAILABLE_MEMORY, &available), 0);
+  EXPECT_EQ(available.available, t.loaded.device.local_mem_size);
+
+  kfd_ioctl_alloc_memory_of_gpu_args alloc{};
+  alloc.va_addr = 0x100000000ULL;
+  alloc.size = 0x1000;
+  alloc.gpu_id = drv->gpu_id();
+  alloc.flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE;
+  ASSERT_EQ(drv->ioctl(AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, &alloc), 0);
+
+  available = {};
+  available.gpu_id = drv->gpu_id();
+  ASSERT_EQ(drv->ioctl(AMDKFD_IOC_AVAILABLE_MEMORY, &available), 0);
+  EXPECT_EQ(available.available, t.loaded.device.local_mem_size - alloc.size);
+
+  kfd_ioctl_free_memory_of_gpu_args freed{};
+  freed.handle = alloc.handle;
+  EXPECT_EQ(drv->ioctl(AMDKFD_IOC_FREE_MEMORY_OF_GPU, &freed), 0);
+  EXPECT_EQ(drv->close(), 0);
+}
+
 TEST_F(SimulatedKfdTest, DoorbellClientRemapKeepsDriverAliasStableWhenOffsetRecycles) {
   auto t = create_test_vm();
   auto *driver = t.driver();
