@@ -135,6 +135,16 @@ public:
     it->second.client_mem_fd.reset(duplicate);
   }
 
+  /// @brief Return whether an unmapped VA could be accessed as client process memory.
+  bool has_client_memory_range(uint64_t addr, size_t size, uint32_t vmid = 0) const {
+    if (vmid == 0 || addr == 0 || size == 0 ||
+        size - 1 > std::numeric_limits<uint64_t>::max() - addr)
+      return false;
+    if (addr >= kUserSpaceLimit || size > kUserSpaceLimit - addr)
+      return false;
+    return client_pid_for_vmid(vmid) > 0;
+  }
+
   /// @brief Enable passthrough for unmapped addresses (local/user-mode only).
   /// @details When true, addresses not found in the page table are treated as
   /// host pointers (GPU VA == host VA). This mirrors QEMU user-mode's identity

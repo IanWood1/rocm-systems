@@ -2507,6 +2507,12 @@ void CommandProcessor::process_sdma_ring(HwQueue &queue, uint64_t read_idx, uint
   auto resolve = [&](uint64_t va, size_t size = 1) -> void * {
     return resolve_sdma_ptr(memory_, va, queue.process_id, size);
   };
+  auto has_indirect_sdma_range = [&](uint64_t va, size_t size) {
+    if (size == 0 || size - 1 > std::numeric_limits<uint64_t>::max() - va)
+      return false;
+    return memory_->has_range_mapping(va, size, queue.process_id) ||
+           memory_->has_client_memory_range(va, size, queue.process_id);
+  };
   auto copy_linear = [&](uint64_t src_va, std::span<const uint64_t> dst_vas, uint32_t count) {
     const auto range_fits = [count](uint64_t va) {
       return static_cast<uint64_t>(count - 1) <= std::numeric_limits<uint64_t>::max() - va;
@@ -2610,11 +2616,17 @@ void CommandProcessor::process_sdma_ring(HwQueue &queue, uint64_t read_idx, uint
           uint64_t wait_mask = static_cast<uint64_t>(dw(6)) | (static_cast<uint64_t>(dw(7)) << 32);
           if (wait_addr > 0x1000) {
             auto *wait_ptr = static_cast<uint64_t *>(resolve(wait_addr, sizeof(uint64_t)));
-            if (!wait_ptr) {
+            uint64_t wait_value = 0;
+            if (wait_ptr) {
+              wait_value =
+                  std::atomic_ref<uint64_t>(*wait_ptr).load(std::memory_order_acquire);
+            } else if (has_indirect_sdma_range(wait_addr, sizeof(uint64_t))) {
+              auto wait_bytes =
+                  std::span<uint8_t>(reinterpret_cast<uint8_t *>(&wait_value), sizeof(wait_value));
+              memory_->read_block(wait_addr, wait_bytes, queue.process_id);
+            } else {
               return stop_and_retry_current_packet();
             }
-            uint64_t wait_value =
-                std::atomic_ref<uint64_t>(*wait_ptr).load(std::memory_order_acquire);
             if (!sdma_compare_u64(wait_func, wait_value & wait_mask, wait_ref)) {
               return stop_and_retry_current_packet();
             }
@@ -2625,6 +2637,7 @@ void CommandProcessor::process_sdma_ring(HwQueue &queue, uint64_t read_idx, uint
         uint64_t signal_addr = 0;
         uint64_t signal_data = 0;
         bool signal_decrement = false;
+        bool signal_indirect_decrement = false;
         if (has_signal) {
           uint32_t signal_op = dw(signal_base) & 0x7F;
           signal_addr = (static_cast<uint64_t>(dw(signal_base + 1) & ~0x7u)) |
@@ -2634,7 +2647,9 @@ void CommandProcessor::process_sdma_ring(HwQueue &queue, uint64_t read_idx, uint
 
           if (signal_addr > 0x1000 && signal_op == 0x70) {
             signal_ptr = static_cast<int64_t *>(resolve(signal_addr, sizeof(int64_t)));
-            if (!signal_ptr) {
+            if (!signal_ptr && has_indirect_sdma_range(signal_addr, sizeof(int64_t))) {
+              signal_indirect_decrement = true;
+            } else if (!signal_ptr) {
               return stop_and_retry_current_packet();
             }
             signal_decrement = true;
@@ -2661,8 +2676,20 @@ void CommandProcessor::process_sdma_ring(HwQueue &queue, uint64_t read_idx, uint
           return stop_and_retry_current_packet();
 
         if (signal_decrement) {
-          std::atomic_ref<int64_t>(*signal_ptr)
-              .fetch_sub(static_cast<int64_t>(signal_data), std::memory_order_release);
+          if (signal_ptr) {
+            std::atomic_ref<int64_t>(*signal_ptr)
+                .fetch_sub(static_cast<int64_t>(signal_data), std::memory_order_release);
+          } else if (signal_indirect_decrement) {
+            int64_t value = 0;
+            auto value_bytes =
+                std::span<uint8_t>(reinterpret_cast<uint8_t *>(&value), sizeof(value));
+            memory_->read_block(signal_addr, value_bytes, queue.process_id);
+            value -= static_cast<int64_t>(signal_data);
+            memory_->write_block(
+                signal_addr,
+                std::span<const uint8_t>(reinterpret_cast<const uint8_t *>(&value), sizeof(value)),
+                queue.process_id);
+          }
         }
 
         pkt_dwords = packet_dwords;
@@ -2718,6 +2745,14 @@ void CommandProcessor::process_sdma_ring(HwQueue &queue, uint64_t read_idx, uint
           // published first and the fence write supersedes it.
           flush_gpu_caches();
           std::atomic_ref<uint64_t>(*ptr).store(data, std::memory_order_release);
+        } else if (has_indirect_sdma_range(addr_va, sizeof(data))) {
+          flush_gpu_caches();
+          memory_->write_block(
+              addr_va,
+              std::span<const uint8_t>(reinterpret_cast<const uint8_t *>(&data), sizeof(data)),
+              queue.process_id);
+        } else {
+          return stop_and_retry_current_packet();
         }
         pkt_dwords = sdma::FENCE_64B_GFX11_PLUS_SIZE;
         break;
@@ -2729,6 +2764,14 @@ void CommandProcessor::process_sdma_ring(HwQueue &queue, uint64_t read_idx, uint
       if (ptr) {
         flush_gpu_caches();
         std::atomic_ref<uint32_t>(*ptr).store(data, std::memory_order_release);
+      } else if (has_indirect_sdma_range(addr_va, sizeof(data))) {
+        flush_gpu_caches();
+        memory_->write_block(
+            addr_va,
+            std::span<const uint8_t>(reinterpret_cast<const uint8_t *>(&data), sizeof(data)),
+            queue.process_id);
+      } else {
+        return stop_and_retry_current_packet();
       }
       pkt_dwords = sdma::FENCE_SIZE;
       break;
@@ -2753,10 +2796,15 @@ void CommandProcessor::process_sdma_ring(HwQueue &queue, uint64_t read_idx, uint
         uint64_t mask = static_cast<uint64_t>(dw(5)) | (static_cast<uint64_t>(dw(6)) << 32);
         if (addr > 0x1000) {
           auto *ptr = static_cast<uint64_t *>(resolve(addr, sizeof(uint64_t)));
-          if (!ptr) {
+          uint64_t val = 0;
+          if (ptr) {
+            val = std::atomic_ref<uint64_t>(*ptr).load(std::memory_order_acquire);
+          } else if (has_indirect_sdma_range(addr, sizeof(uint64_t))) {
+            auto val_bytes = std::span<uint8_t>(reinterpret_cast<uint8_t *>(&val), sizeof(val));
+            memory_->read_block(addr, val_bytes, queue.process_id);
+          } else {
             return stop_and_retry_current_packet();
           }
-          uint64_t val = std::atomic_ref<uint64_t>(*ptr).load(std::memory_order_acquire);
           if (!sdma_compare_u64(func, val & mask, ref)) {
             return stop_and_retry_current_packet();
           }
@@ -2775,9 +2823,6 @@ void CommandProcessor::process_sdma_ring(HwQueue &queue, uint64_t read_idx, uint
         // Register poll / HDP flush — no-op in functional sim.
       } else if (addr_va > 0x1000) {
         auto *ptr = static_cast<uint32_t *>(resolve(addr_va, sizeof(uint32_t)));
-        if (!ptr) {
-          return stop_and_retry_current_packet();
-        }
         auto compare = [func](uint32_t val, uint32_t reference) -> bool {
           switch (func) {
           case 0:
@@ -2798,7 +2843,15 @@ void CommandProcessor::process_sdma_ring(HwQueue &queue, uint64_t read_idx, uint
             return true;
           }
         };
-        uint32_t val = std::atomic_ref<uint32_t>(*ptr).load(std::memory_order_acquire);
+        uint32_t val = 0;
+        if (ptr) {
+          val = std::atomic_ref<uint32_t>(*ptr).load(std::memory_order_acquire);
+        } else if (has_indirect_sdma_range(addr_va, sizeof(uint32_t))) {
+          auto val_bytes = std::span<uint8_t>(reinterpret_cast<uint8_t *>(&val), sizeof(val));
+          memory_->read_block(addr_va, val_bytes, queue.process_id);
+        } else {
+          return stop_and_retry_current_packet();
+        }
         if (!compare(val & mask, ref)) {
           return stop_and_retry_current_packet();
         }
