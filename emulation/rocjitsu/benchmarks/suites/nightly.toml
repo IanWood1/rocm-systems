@@ -1,0 +1,24 @@
+schema = "rocjitsu.benchmark.suite.v1"
+name = "nightly"
+description = "Symmetric rocjitsu nightly benchmark suite"
+targets = ["gfx950", "gfx1250"]
+budget_seconds = 1800
+
+cases = [
+  "hip.launch_noop",
+  "hip.copy_fp32_32m",
+  "hip.vector_add_fp32_tail",
+  "triton.softmax_fp16_aligned",
+  "triton.softmax_fp16_boundary",
+  "triton.rmsnorm_bf16",
+  "triton.gemm_bf16_aligned",
+  "triton.gemm_bf16_ragged",
+  "triton.attention_fp16",
+  "tensile.gemm_fp16",
+  "tensile.gemm_bf16_batched",
+  "tensile.gemm_fp8_scaled",
+]
+
+[measurement]
+warmups = 3
+samples = 21

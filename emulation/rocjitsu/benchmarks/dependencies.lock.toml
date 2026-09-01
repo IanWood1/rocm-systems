@@ -1,0 +1,25 @@
+schema = "rocjitsu.benchmark.dependencies.v1"
+
+[rocm_sdk]
+distribution = "rocm-sdk-devel"
+version = "10.1.0a20260812"
+python = "3.12"
+notes = "The native workload build and HIP runtime must support both targets."
+
+[pytorch]
+distribution = "torch"
+version = "2.14.0a0+rocm10.1.0a20260812"
+required = true
+
+[triton]
+distribution = "triton"
+version = "3.8.0+git675c5987.rocm10.1.0a20260812"
+package_revision = "675c5987"
+repository = "https://github.com/ROCm/triton"
+
+[hipblaslt]
+distribution = "rocm-sdk-libraries"
+distribution_version = "10.1.0a20260812"
+package_version = "1.4.1"
+adapter = "hipblaslt_cpp"
+algorithm_policy = "first_heuristic"

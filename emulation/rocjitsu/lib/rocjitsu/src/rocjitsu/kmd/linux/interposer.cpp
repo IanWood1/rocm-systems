@@ -372,6 +372,14 @@ public:
   void reset_after_fork() {
     owner_pid_ = getpid();
     active_driver_.store(nullptr, std::memory_order_release);
+    // A fork child does not inherit the local VM worker.  The std::thread object
+    // itself lives in the child's copied address space, but its thread no longer
+    // exists and must never be joined or destroyed there.  Drop the pointer just
+    // like the inherited VM pointer below; the OS reclaims the child's private
+    // copy on exec/_exit.
+    local_vm_thread_ = nullptr;
+    local_runtime_enabled_ = false;
+    local_vm_finalization_requested_ = false;
     rj_vm_ = nullptr;
     if (guest_driver_)
       guest_driver_->reset_after_fork();
@@ -1328,7 +1336,49 @@ public:
 
   void start_local_vm() {
     assert(rj_vm_ != nullptr);
-    std::thread([vm = rj_vm_]() { rj_vm_run(vm, nullptr); }).detach();
+    assert(local_vm_thread_ == nullptr);
+    // Keep the worker joinable so normal process teardown can request an engine
+    // exit, wait for all simulation callbacks to finish, and let rj_vm_run()
+    // finalize execution plugins before their sinks disappear.
+    local_vm_thread_ = new std::thread([vm = rj_vm_]() { rj_vm_run(vm, nullptr); });
+  }
+
+  /// @brief Record a successful local KFD runtime-enable/disable transition.
+  /// @details ROCr destroys its agents, queues, mappings, and scratch allocations
+  /// before issuing RUNTIME_ENABLE with a zero mode mask from KfdDriver::ShutDown.
+  /// If the preload-library finalizer already requested shutdown, that disable is
+  /// therefore the first safe point at which the simulator worker can stop.
+  void note_local_runtime_state(bool enabled) {
+    if (!owned_by_current_process())
+      return;
+
+    std::lock_guard lock(init_mutex_);
+    local_runtime_enabled_ = enabled;
+    if (!enabled && local_vm_finalization_requested_)
+      stop_local_vm_locked();
+  }
+
+  /// @brief Gracefully finish a local simulator during process teardown.
+  /// @details InterposerContext intentionally has no C++ destructor because a
+  /// fork child may contain copied synchronization objects and a dead parent
+  /// worker. A preload DSO can finalize before ROCr, so this records the request
+  /// but defers stopping the engine while ROCr's KFD runtime is enabled. ROCr's
+  /// later runtime-disable ioctl follows its KFD cleanup and calls
+  /// stop_local_vm_locked(). If ROCr already shut down (or was never initialized),
+  /// the worker stops here. rj_vm_run() performs ordered plugin shutdown.
+  void request_local_vm_finalization() {
+    // Check the PID before touching a possibly inherited, locked mutex. A fork
+    // child cannot join the vanished parent worker and must leave its copied
+    // context for the OS to reclaim.
+    if (!owned_by_current_process())
+      return;
+
+    std::lock_guard lock(init_mutex_);
+    if (!rj_vm_)
+      return;
+    local_vm_finalization_requested_ = true;
+    if (!local_runtime_enabled_)
+      stop_local_vm_locked();
   }
 
   /// @brief A GEM buffer object synthesized from a prime (dmabuf) fd.
@@ -1749,7 +1799,7 @@ public:
       // engine thread: the release-store of active_driver_ pairs with acquire
       // loads in driver()/initialized(), so any reader that observes the driver
       // also observes all of the setup above (config, plugin group, sinks).
-      // Starting rj_vm_run() before the store would let the detached engine
+      // Starting rj_vm_run() before the store would let the asynchronous engine
       // thread begin mutating the VM before it is published.
       LinuxKfd *driver = rj_vm_->vm->driver();
       active_driver_.store(driver, std::memory_order_release);
@@ -1805,8 +1855,33 @@ public:
   }
 
 private:
+  /// @brief Stop and join the local VM worker while init_mutex_ is held.
+  /// @details The VM and driver remain published after the worker stops because
+  /// ROCr can still issue ReleaseSystemProperties/close calls after its runtime
+  /// disable. Process exit reclaims this deliberately retained state.
+  void stop_local_vm_locked() {
+    if (!rj_vm_ || !local_vm_thread_)
+      return;
+    rj_vm_request_exit(rj_vm_, "local interposer shutdown");
+    if (local_vm_thread_->joinable())
+      local_vm_thread_->join();
+    delete local_vm_thread_;
+    local_vm_thread_ = nullptr;
+
+    // Keep the VM and driver published while later-loaded ROCm DSOs run their
+    // finalizers. Destroying the KFD here makes a later cleanup ioctl fail and
+    // can leave ROCr spinning in scratch cleanup.
+  }
+
   pid_t owner_pid_ = 0;
   rj_vm_t *rj_vm_ = nullptr;
+  // Heap allocation is deliberate: reset_after_fork() can abandon the child's
+  // copy without invoking std::thread::~thread() on a joinable parent worker.
+  std::thread *local_vm_thread_ = nullptr;
+  // Protected by init_mutex_. The runtime state gates finalization so the
+  // simulator stays available until ROCr has released all KFD-owned resources.
+  bool local_runtime_enabled_ = false;
+  bool local_vm_finalization_requested_ = false;
   std::unique_ptr<GuestKfd> guest_driver_;
   std::atomic<LinuxKfd *> active_driver_{nullptr};
   /// @brief Active daemon-mode remote driver, or nullptr in local mode.
@@ -1964,8 +2039,9 @@ private:
 };
 
 // Storage for the singleton is never destructed. Using aligned raw storage
-// avoids __cxa_finalize destroying the object while the detached engine
-// thread is still running.
+// avoids C++ teardown ordering hazards; explicit exit finalization arranges an
+// ordered stop/join of the local VM worker while deliberately retaining
+// VM-owned state for ROCm finalizers that may run afterward.
 alignas(16) uint8_t InterposerContext::storage_[sizeof(InterposerContext)];
 InterposerContext &InterposerContext::ctx =
     *reinterpret_cast<InterposerContext *>(InterposerContext::storage_);
@@ -2267,7 +2343,9 @@ RJ_INTERPOSER_EXPORT int close(int fd) {
   return static_cast<int>(InterposerContext::real().close(fd));
 }
 
-__attribute__((destructor(101))) void rj_interposer_shutdown() {}
+__attribute__((destructor(101))) void rj_interposer_shutdown() {
+  InterposerContext::ctx.request_local_vm_finalization();
+}
 
 RJ_INTERPOSER_EXPORT int ioctl(int fd, unsigned long request, ...) {
   assert(InterposerContext::real().ready());
@@ -2564,6 +2642,14 @@ RJ_INTERPOSER_EXPORT int ioctl(int fd, unsigned long request, ...) {
         return kfd_ioctl_ret(remote->ioctl(request, arg));
     } else if (auto *drv = InterposerContext::ctx.driver()) {
       int rc = drv->ioctl(request, arg);
+      // A preload DSO may receive its destructor before ROCr. Keep servicing KFD
+      // cleanup until ROCr disables the runtime, then stop/join the simulator so
+      // execution plugins flush their one-time shutdown records before exit.
+      if (rc == 0 && request == AMDKFD_IOC_RUNTIME_ENABLE && arg) {
+        const auto *runtime = static_cast<const kfd_ioctl_runtime_enable_args *>(arg);
+        const bool enabled = (runtime->mode_mask & KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK) != 0;
+        InterposerContext::ctx.note_local_runtime_state(enabled);
+      }
       // Capture the KFD allocation flags for a freshly exported dmabuf fd. The
       // flags determine the GPU PTE MTYPE when the fd is later mapped via GEM_VA,
       // and must be recorded now because the allocation may be freed first. Only

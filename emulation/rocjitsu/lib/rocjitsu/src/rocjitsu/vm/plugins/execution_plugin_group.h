@@ -249,16 +249,14 @@ public:
   static std::shared_ptr<ExecutionPluginGroup> empty_group() {
     // Immortal singleton: the shared_ptr is heap-allocated and deliberately never
     // deleted, so its control block outlives process teardown. In local-mode
-    // (LD_PRELOAD interposer) the simulation engine runs on a detached thread that
-    // is still executing when exit() drives static/atexit destructors on the main
-    // thread. A plain function-local `static shared_ptr` would have its control
-    // block destroyed by a __cxa_atexit handler during __run_exit_handlers while the
-    // engine thread is mid-startup() copying this default plugin group into a
-    // CompletionTracker/ComputeUnit — a data race on the refcount that surfaced as a
-    // use-after-free SIGSEGV in _Sp_counted_base::_M_release under `ctest -jN`.
-    // Leaking the control block removes that teardown race; the OS reclaims the
-    // memory at process death. Matches the interposer singleton's never-destructed
-    // design for the same reason.
+    // (LD_PRELOAD interposer) the simulation engine runs asynchronously until exit
+    // finalization requests shutdown; the worker is joined no earlier than ROCr's
+    // runtime disable. A plain function-local `static shared_ptr` may still have its
+    // control block destroyed earlier by __cxa_atexit while the engine is starting
+    // or while DSO finalizers are ordered, creating a data race on the refcount.
+    // Leaking the control block removes that teardown-order dependency; the OS
+    // reclaims it at process death. This matches the interposer's never-destructed
+    // singleton and retained exit-time VM state.
     static std::shared_ptr<ExecutionPluginGroup> *instance =
         new std::shared_ptr<ExecutionPluginGroup>(
             std::make_shared<ExecutionPluginGroup>(PluginSinkConfig{}));

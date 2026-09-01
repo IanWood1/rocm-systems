@@ -2430,6 +2430,7 @@ if(RJ_ENABLE_HIP_TESTS)
         # Daemon-mode plugin coverage uses a placeholder sink directory that
         # the test rewrites to a private runtime path.
         set(RJ_TEST_SINK_DIR "__RJ_DAEMON_SINK_DIR__")
+        set(RJ_TEST_ADDITIONAL_PLUGINS "")
         configure_file(
             ${CMAKE_CURRENT_SOURCE_DIR}/logging/logging_test_config.json.in
             ${CMAKE_CURRENT_BINARY_DIR}/daemon_logging_config.json
@@ -2640,11 +2641,22 @@ if(RJ_ENABLE_HIP_TESTS)
             ARCH gfx950
             SOURCE logging/hip_logging_test.hip
         )
+        # The configs below load the runtime plugin DSOs by soname. Make a
+        # focused hip_logging_test_target build sufficient to run these tests;
+        # otherwise only an all-target build happens to produce the DSOs.
+        if(TARGET rocjitsu_plugin_logging_so)
+            add_dependencies(
+                hip_logging_test_target
+                rocjitsu_plugin_logging_so
+                rocjitsu_plugin_throughput_so
+            )
+        endif()
         set(LOGGING_SINK_DIR ${CMAKE_CURRENT_BINARY_DIR}/logging_test_output)
         set(LOGGING_RUNTIME_DIR ${LOGGING_SINK_DIR}/runtime)
         file(MAKE_DIRECTORY ${LOGGING_SINK_DIR})
         file(MAKE_DIRECTORY ${LOGGING_RUNTIME_DIR})
         set(RJ_TEST_SINK_DIR ${LOGGING_SINK_DIR})
+        set(RJ_TEST_ADDITIONAL_PLUGINS "")
         configure_file(
             ${CMAKE_CURRENT_SOURCE_DIR}/logging/logging_test_config.json.in
             ${LOGGING_SINK_DIR}/config.json
@@ -2677,6 +2689,81 @@ if(RJ_ENABLE_HIP_TESTS)
             ENVIRONMENT
                 "ROCJITSU_RUNTIME_DIR=${LOGGING_RUNTIME_DIR}"
                 "RJ_SINK_DIR=${LOGGING_SINK_DIR}"
+        )
+
+        # Exercise normal HIP/ROCr process teardown through the preload
+        # interposer. The test-specific config enables throughput in addition to
+        # logging so the child workload can keep its existing in-process checks,
+        # while the parent CMake script verifies exit-time plugin finalization.
+        set(THROUGHPUT_EXIT_SINK_DIR
+            ${CMAKE_CURRENT_BINARY_DIR}/throughput_exit_test_output
+        )
+        set(THROUGHPUT_EXIT_RUNTIME_DIR
+            ${THROUGHPUT_EXIT_SINK_DIR}/runtime
+        )
+        file(MAKE_DIRECTORY ${THROUGHPUT_EXIT_SINK_DIR})
+        file(MAKE_DIRECTORY ${THROUGHPUT_EXIT_RUNTIME_DIR})
+        set(RJ_TEST_SINK_DIR ${THROUGHPUT_EXIT_SINK_DIR})
+        set(
+            RJ_TEST_ADDITIONAL_PLUGINS
+            ",\n    \"throughput\": {}"
+        )
+        set(THROUGHPUT_EXIT_CONFIG
+            ${THROUGHPUT_EXIT_SINK_DIR}/config.json
+        )
+        configure_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/logging/logging_test_config.json.in
+            ${THROUGHPUT_EXIT_CONFIG}
+            @ONLY
+        )
+
+        set(THROUGHPUT_EXIT_INSTALLED_CONFIG_DIR
+            ${CMAKE_CURRENT_BINARY_DIR}/install-configs
+        )
+        set(THROUGHPUT_EXIT_INSTALLED_CONFIG
+            ${THROUGHPUT_EXIT_INSTALLED_CONFIG_DIR}/throughput_exit.json
+        )
+        set(RJ_TEST_SINK_DIR runtime/throughput_exit_test_output)
+        configure_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/logging/logging_test_config.json.in
+            ${THROUGHPUT_EXIT_INSTALLED_CONFIG}
+            @ONLY
+        )
+        if(RJ_INSTALL_TESTS)
+            install(
+                FILES ${THROUGHPUT_EXIT_INSTALLED_CONFIG}
+                DESTINATION ${CMAKE_INSTALL_DATADIR}/rocjitsu/configs/tests
+            )
+            install(
+                FILES
+                    ${CMAKE_CURRENT_SOURCE_DIR}/logging/verify_interposer_exit.cmake
+                DESTINATION ${RJ_INSTALL_TEST_DIR}
+            )
+        endif()
+
+        rj_add_test(
+            NAME InterposerLifecycleTest.NormalExitFlushesThroughputOnce
+            COMMAND
+                ${CMAKE_COMMAND}
+                "-DTEST_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/hip_logging_test"
+                "-DTEST_FILTER=LoggingTest.dispatch_logged"
+                "-DTEST_LAUNCHER=${RJ_CLI}"
+                "-DTEST_CONFIG=${THROUGHPUT_EXIT_CONFIG}"
+                "-DTEST_SINK_DIR=${THROUGHPUT_EXIT_SINK_DIR}"
+                -P
+                ${CMAKE_CURRENT_SOURCE_DIR}/logging/verify_interposer_exit.cmake
+            TIMEOUT 30
+            ENVIRONMENT
+                "ROCJITSU_RUNTIME_DIR=${THROUGHPUT_EXIT_RUNTIME_DIR}"
+            INSTALL_COMMAND
+                ${CMAKE_COMMAND}
+                "-DTEST_EXECUTABLE=bin/hip_logging_test"
+                "-DTEST_FILTER=LoggingTest.dispatch_logged"
+                "-DTEST_LAUNCHER=\${RJ_INSTALLED_BINDIR}/rocjitsu"
+                "-DTEST_CONFIG=\${RJ_INSTALLED_CONFIG_DIR}/tests/throughput_exit.json"
+                "-DTEST_SINK_DIR=runtime/throughput_exit_test_output"
+                -P
+                verify_interposer_exit.cmake
         )
 
         add_subdirectory(race-detector)

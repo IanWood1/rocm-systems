@@ -85,7 +85,7 @@
     ]
   },
   "plugins": {
-    "logging": {}
+    "logging": {}@RJ_TEST_ADDITIONAL_PLUGINS@
   },
   "sinks": {
     "types": ["file"],
