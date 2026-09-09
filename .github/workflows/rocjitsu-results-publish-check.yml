@@ -1,0 +1,86 @@
+name: Rocjitsu results publication check
+
+on:
+  # A push trigger lets this workflow be tested from the topic branch in the
+  # author's fork, where workflow_dispatch is not available until merge.
+  push:
+    branches:
+      - users/ianwood2/rocjitsu-publish-check
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-results-branch-write:
+    # Fork pushes exercise the mechanism before merge. In the canonical
+    # repository, require a maintainer to start the check explicitly.
+    if: >-
+      (github.repository == 'IanWood1/rocm-systems' &&
+       github.ref == 'refs/heads/users/ianwood2/rocjitsu-publish-check') ||
+      (github.repository == 'ROCm/rocm-systems' &&
+       github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      TEST_BRANCH: rocjitsu-publish-canary-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: true
+
+      - name: Create and update a canary branch
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "${TEST_BRANCH}"
+
+          marker="rocjitsu-publish-canary.json"
+          printf '{"phase":"create","runId":"%s","runAttempt":"%s","sourceSha":"%s"}\n' \
+            "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${GITHUB_SHA}" > "${marker}"
+          git add -- "${marker}"
+          git commit -s -m "Test rocjitsu results branch creation"
+          git push origin "HEAD:refs/heads/${TEST_BRANCH}"
+          remote_sha="$(
+            git ls-remote --exit-code --heads \
+              origin "refs/heads/${TEST_BRANCH}" | awk '{print $1}'
+          )"
+          test "${remote_sha}" = "$(git rev-parse HEAD)"
+
+          printf '{"phase":"update","runId":"%s","runAttempt":"%s","sourceSha":"%s"}\n' \
+            "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${GITHUB_SHA}" > "${marker}"
+          git add -- "${marker}"
+          git commit -s -m "Test rocjitsu results branch update"
+          git push origin "HEAD:refs/heads/${TEST_BRANCH}"
+
+          remote_sha="$(
+            git ls-remote --exit-code --heads \
+              origin "refs/heads/${TEST_BRANCH}" | awk '{print $1}'
+          )"
+          test "${remote_sha}" = "$(git rev-parse HEAD)"
+
+      - name: Remove canary branch
+        if: always()
+        run: |
+          set -euo pipefail
+          remote_sha="$(
+            git ls-remote --heads \
+              origin "refs/heads/${TEST_BRANCH}" | awk '{print $1}'
+          )"
+          if [[ -n "${remote_sha}" ]]; then
+            git push origin --delete "${TEST_BRANCH}"
+          fi
+          remote_sha="$(
+            git ls-remote --heads \
+              origin "refs/heads/${TEST_BRANCH}" | awk '{print $1}'
+          )"
+          if [[ -n "${remote_sha}" ]]; then
+            echo "::error::Canary branch still exists after cleanup"
+            exit 1
+          fi
