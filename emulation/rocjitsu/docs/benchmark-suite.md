@@ -6,10 +6,12 @@ result publisher live in
 See its `benchmarks/README.md` for workload definitions, source revisions,
 measurement details, plugin profiles, and result formats.
 
-The nightly suite runs 28 cases on each of `gfx950` and `gfx1250` (56 cells),
+The nightly suite runs 28 Triton cases on each of `gfx950` and `gfx1250`,
+plus one existing BF16 HipKittens corpus case per target (58 cells),
 with eight simulator threads. Sixteen cases cover FP16/BF16 GEMMs across square,
 tall, wide, long-reduction, and ragged shapes. The benchmark step has a 30-minute
-timeout; dependency installation, building, and publication are separate.
+timeout, including the native corpus builds; dependency installation, the
+rocjitsu build, and publication are separate.
 Compilation, allocation, and warmup happen outside measured samples. Follow
 [Benchmarking rocjitsu](benchmarking.md) for official performance comparisons.
 
@@ -59,7 +61,10 @@ cmake --build "$build" --target rocjitsu_plugin_logging_so
 Then use the corpus's `plugin-overhead.toml` suite and matching
 `--plugin-profile`, with a fresh output directory for each profile.
 
-Suite TOML files define each Triton case and its input parameters.
+Suite TOML files define each Triton case and its input parameters, or select
+an existing native corpus case and variant. Native benchmarks reuse the corpus
+Release build adapter and emit the same dashboard format. Their configure/build
+logs are included in the diagnostics artifact.
 Use `--list` to inspect cases without building or installing GPU dependencies.
 
 ## CI publication

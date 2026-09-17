@@ -70,7 +70,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: ROCm/rocjitsu-test-corpus
-          ref: 4b38b83fb8e0c3c524fc8943b7fff80076eebea9
+          ref: d4b4de820188a6ff74c7b78055d4561cd04ea479
           path: rocjitsu-test-corpus
           persist-credentials: false
 
@@ -159,6 +159,8 @@ jobs:
           path: |
             ${{ env.ROCJITSU_RESULT_DIR }}/run.json
             ${{ env.ROCJITSU_RESULT_DIR }}/cases
+            ${{ env.ROCJITSU_RESULT_DIR }}/native/**/configure.log
+            ${{ env.ROCJITSU_RESULT_DIR }}/native/**/build.log
             ${{ env.ROCJITSU_RESULT_DIR }}/workflow.txt
           if-no-files-found: error
           retention-days: 14
