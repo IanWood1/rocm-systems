@@ -641,6 +641,9 @@ public:
   /// @details The lookup and snapshot occur under one lock, so unregister and
   /// VMID reuse cannot substitute a different generation between them.
   [[nodiscard]] std::optional<GpuVmAccess> snapshot_vmid(uint32_t vmid) const;
+  /// @brief Reuse an owning data-access snapshot on the current host thread.
+  /// @details Metadata is captured until retirement; use snapshot_vmid() for fresh queue counts.
+  [[nodiscard]] std::shared_ptr<const GpuVmAccess> cached_access_vmid(uint32_t vmid) const;
 
   [[nodiscard]] VmTranslationResult translate(AddressSpaceHandle handle, uint64_t address,
                                               std::size_t size, VmAccessKind access) const;
@@ -695,6 +698,7 @@ private:
   void advance_access_state_locked(Binding &binding);
   void revoke_access_state_locked(Binding &binding);
 
+  const uint64_t access_cache_id_;
   mutable std::mutex mutex_;
   std::vector<Slot> slots_;
   std::vector<uint32_t> free_slots_;

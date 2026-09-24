@@ -158,7 +158,7 @@ VmAccessOutcome MemorySideCache::send_atomic_backing(uint64_t addr, uint32_t siz
 bool MemorySideCache::can_fetch_line(uint64_t addr, uint32_t vmid) const {
   if (vmid == 0 || gpu_vm_ == nullptr)
     return true;
-  const std::optional<GpuVmAccess> vm_access = gpu_vm_->snapshot_vmid(vmid);
+  const std::shared_ptr<const GpuVmAccess> vm_access = gpu_vm_->cached_access_vmid(vmid);
   return vm_access && vm_access->query_access(CacheStore::line_address(addr), LINE_SIZE,
                                               VmAccessKind::Read) == VmAccessOutcome::Complete;
 }
@@ -378,7 +378,7 @@ VmAccessOutcome MemorySideCache::flush_dirty_to_legacy_backing_locked() {
           legacy_maintenance_memory_->write_block(line_addr, bytes);
           outcome = VmAccessOutcome::Complete;
         } else {
-          std::optional<GpuVmAccess> vm_access = legacy_maintenance_vm_->snapshot_vmid(tag.vmid);
+          std::shared_ptr<const GpuVmAccess> vm_access = legacy_maintenance_vm_->cached_access_vmid(tag.vmid);
           outcome = vm_access ? vm_access->write(line_addr, std::as_bytes(bytes))
                               : VmAccessOutcome::Faulted;
         }

@@ -7,6 +7,7 @@
 #include "rocjitsu/vm/amdgpu/mtype.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 
 namespace rocjitsu {
@@ -16,11 +17,11 @@ namespace amdgpu {
 class RequestMtypeResolver {
 public:
   RequestMtypeResolver(GpuVm *gpu_vm, uint32_t vmid)
-      : access_(vmid != 0 && gpu_vm != nullptr ? gpu_vm->snapshot_vmid(vmid) : std::nullopt),
+      : access_(vmid != 0 && gpu_vm != nullptr ? gpu_vm->cached_access_vmid(vmid) : nullptr),
         fallback_(Mtype::RW), combine_(false) {}
 
   RequestMtypeResolver(GpuVm *gpu_vm, uint32_t vmid, Mtype instruction_mtype)
-      : access_(vmid != 0 && gpu_vm != nullptr ? gpu_vm->snapshot_vmid(vmid) : std::nullopt),
+      : access_(vmid != 0 && gpu_vm != nullptr ? gpu_vm->cached_access_vmid(vmid) : nullptr),
         fallback_(instruction_mtype), combine_(true) {}
 
   Mtype fallback() const { return fallback_; }
@@ -35,7 +36,7 @@ public:
   }
 
 private:
-  std::optional<GpuVmAccess> access_;
+  std::shared_ptr<const GpuVmAccess> access_;
   VmMtypeCache mtype_cache_;
   Mtype fallback_;
   bool combine_;

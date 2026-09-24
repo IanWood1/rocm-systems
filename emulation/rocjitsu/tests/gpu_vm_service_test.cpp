@@ -1000,6 +1000,123 @@ TEST(GpuVmService, ExplicitInvalidationRevokesTheAccessSnapshot) {
   EXPECT_EQ(value[0], std::byte{0x11});
 }
 
+TEST(GpuVmService, CachedAccessDistinguishesServicesAtTheSameAddress) {
+  // optional reuses its object storage while still destroying each service.
+  std::optional<GpuVm> service(std::in_place);
+  GpuVm *const first_address = &*service;
+  ASSERT_TRUE(register_byte_address_space(*service, 7, 0x11));
+  const auto old_access = service->cached_access_vmid(7);
+  ASSERT_TRUE(old_access);
+  ASSERT_TRUE(old_access->is_current());
+
+  service.reset();
+  service.emplace();
+  ASSERT_EQ(&*service, first_address);
+  ASSERT_TRUE(old_access->is_current()) << "address reuse must be detected without revocation";
+  ASSERT_TRUE(register_byte_address_space(*service, 7, 0x22));
+  const auto new_access = service->cached_access_vmid(7);
+  ASSERT_TRUE(new_access);
+  std::array<std::byte, 1> value{};
+  EXPECT_EQ(new_access->read(0, value), VmAccessOutcome::Complete);
+  EXPECT_EQ(value[0], std::byte{0x22});
+  EXPECT_EQ(old_access->read(0, value), VmAccessOutcome::Complete);
+  EXPECT_EQ(value[0], std::byte{0x11});
+}
+
+TEST(GpuVmService, CachedAccessRefreshesAfterRevocationAndVmidReuse) {
+  GpuVm gpu_vm;
+  const auto handle = register_byte_address_space(gpu_vm, 7, 0x11);
+  ASSERT_TRUE(handle);
+  const auto original = gpu_vm.cached_access_vmid(7);
+  ASSERT_TRUE(original);
+  ASSERT_TRUE(gpu_vm.invalidate(handle));
+  EXPECT_FALSE(original->is_current());
+  const auto refreshed = gpu_vm.cached_access_vmid(7);
+  ASSERT_TRUE(refreshed);
+  EXPECT_TRUE(refreshed->is_current());
+  EXPECT_NE(original->cache_namespace(), refreshed->cache_namespace());
+
+  auto backing = std::make_shared<ByteAddressSpace>(0x22);
+  ASSERT_TRUE(gpu_vm.replace_translated(handle, backing, backing));
+  EXPECT_FALSE(refreshed->is_current());
+  const auto replaced = gpu_vm.cached_access_vmid(7);
+  ASSERT_TRUE(replaced);
+  EXPECT_NE(refreshed->cache_namespace(), replaced->cache_namespace());
+  std::array<std::byte, 1> value{};
+  EXPECT_EQ(replaced->read(0, value), VmAccessOutcome::Complete);
+  EXPECT_EQ(value[0], std::byte{0x22});
+
+  ASSERT_TRUE(gpu_vm.unregister_address_space(handle));
+  EXPECT_FALSE(replaced->is_current());
+  EXPECT_FALSE(gpu_vm.cached_access_vmid(7));
+  const auto new_handle = register_byte_address_space(gpu_vm, 7, 0x33);
+  ASSERT_TRUE(new_handle);
+  EXPECT_NE(handle, new_handle);
+  const auto reused = gpu_vm.cached_access_vmid(7);
+  ASSERT_TRUE(reused);
+  EXPECT_EQ(reused->cache_namespace().address_space, new_handle);
+  EXPECT_EQ(reused->read(0, value), VmAccessOutcome::Complete);
+  EXPECT_EQ(value[0], std::byte{0x33});
+  EXPECT_EQ(replaced->read(0, value), VmAccessOutcome::Unavailable);
+}
+
+TEST(GpuVmService, CachedAccessDoesNotCacheMissingVmid) {
+  GpuVm gpu_vm;
+  EXPECT_FALSE(gpu_vm.cached_access_vmid(7));
+  ASSERT_TRUE(register_byte_address_space(gpu_vm, 7, 0x11));
+  const auto access = gpu_vm.cached_access_vmid(7);
+  ASSERT_TRUE(access);
+  std::array<std::byte, 1> value{};
+  EXPECT_EQ(access->read(0, value), VmAccessOutcome::Complete);
+  EXPECT_EQ(value[0], std::byte{0x11});
+}
+
+TEST(GpuVmService, CachedAccessRemainsOwnedAcrossNestedLookups) {
+  GpuVm gpu_vm;
+  ASSERT_TRUE(register_byte_address_space(gpu_vm, 7, 0x11));
+  ASSERT_TRUE(register_byte_address_space(gpu_vm, 8, 0x22));
+  const auto outer = gpu_vm.cached_access_vmid(7);
+  ASSERT_TRUE(outer);
+  {
+    const auto inner = gpu_vm.cached_access_vmid(8);
+    ASSERT_TRUE(inner);
+    std::array<std::byte, 1> value{};
+    EXPECT_EQ(inner->read(0, value), VmAccessOutcome::Complete);
+    EXPECT_EQ(value[0], std::byte{0x22});
+    EXPECT_EQ(outer->read(0, value), VmAccessOutcome::Complete);
+    EXPECT_EQ(value[0], std::byte{0x11});
+  }
+  // A missing nested lookup must not invalidate the caller's owned snapshot.
+  EXPECT_FALSE(gpu_vm.cached_access_vmid(9));
+  std::array<std::byte, 1> value{};
+  EXPECT_EQ(outer->read(0, value), VmAccessOutcome::Complete);
+  EXPECT_EQ(value[0], std::byte{0x11});
+}
+
+TEST(GpuVmService, RegularSnapshotKeepsQueueMetadataFreshAfterCachedAccess) {
+  GpuVm gpu_vm;
+  const auto handle = register_byte_address_space(gpu_vm, 7, 0x11);
+  ASSERT_TRUE(handle);
+  const auto cached = gpu_vm.cached_access_vmid(7);
+  ASSERT_TRUE(cached);
+  EXPECT_EQ(cached->info().queue_references, 0u);
+
+  ASSERT_TRUE(gpu_vm.retain_queue(handle));
+  const auto retained = gpu_vm.snapshot_vmid(7);
+  ASSERT_TRUE(retained);
+  EXPECT_EQ(retained->info().queue_references, 1u);
+  const auto data_access = gpu_vm.cached_access_vmid(7);
+  ASSERT_TRUE(data_access);
+  std::array<std::byte, 1> value{};
+  EXPECT_EQ(data_access->read(0, value), VmAccessOutcome::Complete);
+  EXPECT_EQ(value[0], std::byte{0x11});
+
+  ASSERT_TRUE(gpu_vm.release_queue(handle));
+  const auto released = gpu_vm.snapshot_vmid(7);
+  ASSERT_TRUE(released);
+  EXPECT_EQ(released->info().queue_references, 0u);
+}
+
 TEST(GpuVmService, ClearingGartPreservesItsIdentityAndUnrelatedAddressSpaces) {
   GpuMemory memory("memory");
   GpuVm gpu_vm;
