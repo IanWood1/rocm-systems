@@ -8,6 +8,26 @@ Measure each revision in separate Release build directories and alternate their
 run order. Small simulator changes are easily hidden by CPU frequency, process
 startup, JIT caches, and unrelated host activity.
 
+## Nightly corpus suite
+
+The nightly workflow runs the pinned
+[benchmark corpus](https://github.com/ROCm/rocjitsu-test-corpus/tree/develop/benchmarks)
+and retains raw timings and dashboard results. The suite combines 56 Triton
+cells across gfx950 and gfx1250 with six gfx1250 Tensile SGEMM cells. The Tensile
+cases use two fixed solutions at sizes 127³, 128³, and 129³.
+
+Tensile host support is built from a pinned source revision against the same
+ROCm SDK as the emulator. It reuses packaged GPU code objects. Its build needs
+CMake 3.28+, Ninja, a C++ compiler, and zlib/zstd development libraries, including
+the LLVM libraries supplied by the SDK. Building and loading the workload stay
+outside timing samples; each sample measures the complete GEMM launch sequence
+and synchronization. These durations measure simulator host execution.
+
+For a short Tensile run, use the corpus runner's normal launch/configuration
+arguments with `--manifest benchmarks/suites/tensile-smoke.toml`. The
+[corpus guide](https://github.com/ROCm/rocjitsu-test-corpus/blob/develop/benchmarks/README.md)
+describes case selection, build artifacts, and separate numerical validation.
+
 ## Metrics
 
 | Metric | Use |

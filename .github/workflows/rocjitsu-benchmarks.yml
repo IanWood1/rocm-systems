@@ -17,7 +17,7 @@ defaults:
     shell: bash
 
 env:
-  CORPUS_SHA: e1bac822f3fd2e8c29e3a08ae6c326db1692a757 # rocjitsu-test-corpus#44
+  CORPUS_SHA: bb350d95f8440d41241c8951e9f2ed2354da5a58 # Fixed Tensile SGEMM corpus benchmarks
   ROCJITSU_SOURCE_DIR: ${{ github.workspace }}/rocm-systems/emulation/rocjitsu
   CORPUS_SOURCE_DIR: ${{ github.workspace }}/rocjitsu-test-corpus
   RESULTS_BRANCH: gh-pages-rocjitsu
@@ -47,6 +47,7 @@ jobs:
             echo "ROCJITSU_BUILD_DIR=${BENCHMARK_DIR}/build"
             echo "ROCJITSU_VENV=${BENCHMARK_DIR}/venv"
             echo "ROCJITSU_RESULT_DIR=${BENCHMARK_DIR}/results"
+            echo "ROCJITSU_RUNTIME_DIR=${BENCHMARK_DIR}/runtime"
           } >> "${GITHUB_ENV}"
 
       - name: Install base dependencies
@@ -60,6 +61,8 @@ jobs:
             git \
             libclang-rt-dev \
             libdrm-dev \
+            libzstd-dev \
+            zlib1g-dev \
             ninja-build
 
       - name: Checkout rocm-systems
