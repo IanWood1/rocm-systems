@@ -247,6 +247,7 @@ public:
   /// @brief Execute up to one functional quantum of step() iterations on this CU.
   /// @returns Whether wavefronts ran and whether one requested an event-loop yield.
   FunctionalQuantumResult run_quantum() {
+    GpuVm::AccessCacheScope data_access;
     // A request left by direct step() execution must not shorten this quantum.
     functional_yield_requested_ = false;
     FunctionalQuantumResult result;

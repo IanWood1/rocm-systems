@@ -170,7 +170,12 @@ void GpuVmBindingLease::release() noexcept {
   info_ = {};
 }
 
-GpuVm::GpuVm(Gfx12VmConfig gfx12_config) : gfx12_config_(gfx12_config) {}
+GpuVm::GpuVm(Gfx12VmConfig gfx12_config)
+    : access_cache_id_([] {
+        static std::atomic<uint64_t> next_id{1};
+        return next_id.fetch_add(1, std::memory_order_relaxed);
+      }()),
+      gfx12_config_(gfx12_config) {}
 
 VmAccessOutcome read_translated(const AddressSpaceTranslator &translator,
                                 PhysicalMemoryAccess &memory, uint64_t address,
@@ -993,6 +998,45 @@ std::optional<GpuVmAccess> GpuVm::snapshot_pinned(AddressSpaceHandle handle) {
        .ready = binding->translator != nullptr && binding->physical_memory != nullptr},
       binding->translator, binding->physical_memory, std::move(access_state),
       binding->fault_reporter);
+}
+
+namespace {
+struct AccessCacheEntry {
+  uint64_t service_id = 0;
+  uint32_t vmid = 0;
+  std::shared_ptr<const GpuVmAccess> access;
+};
+struct ScopedAccessCache {
+  uint32_t depth = 0;
+  AccessCacheEntry entry;
+};
+thread_local ScopedAccessCache access_cache;
+} // namespace
+
+GpuVm::AccessCacheScope::AccessCacheScope() { ++access_cache.depth; }
+
+GpuVm::AccessCacheScope::~AccessCacheScope() {
+  if (--access_cache.depth == 0) {
+    AccessCacheEntry released;
+    // Clear ownership before destruction so callbacks can safely open another scope.
+    std::swap(access_cache.entry, released);
+  }
+}
+
+std::shared_ptr<const GpuVmAccess> GpuVm::cached_access_vmid(uint32_t vmid) const {
+  auto &cache = access_cache.entry;
+  if (access_cache.depth != 0 && cache.service_id == access_cache_id_ && cache.vmid == vmid &&
+      cache.access && cache.access->is_current())
+    return cache.access;
+
+  auto snapshot = snapshot_vmid(vmid);
+  auto access = snapshot ? std::make_shared<const GpuVmAccess>(std::move(*snapshot)) : nullptr;
+  if (access_cache.depth != 0) {
+    AccessCacheEntry replacement{access_cache_id_, vmid, access};
+    // Publish a complete entry before releasing the old backing, whose destructor can reenter.
+    std::swap(cache, replacement);
+  }
+  return access;
 }
 
 std::optional<GpuVmAccess> GpuVm::snapshot_vmid(uint32_t vmid) const {

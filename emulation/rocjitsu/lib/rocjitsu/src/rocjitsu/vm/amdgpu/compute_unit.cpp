@@ -1965,6 +1965,7 @@ template <bool EnableAsync>
   // A wave reaching s_endpgm in this loop retires its workgroup; the guard sends
   // the CP its completion after the lock is released. See WaveStateGuard.
   WaveStateGuard wave_state_lock(*this);
+  GpuVm::AccessCacheScope data_access;
   tick_pipelines();
   update_wf_states();
 

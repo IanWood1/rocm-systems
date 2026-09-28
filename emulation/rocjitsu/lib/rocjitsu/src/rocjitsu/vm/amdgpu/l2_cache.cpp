@@ -146,9 +146,9 @@ VmAccessOutcome L2Cache::publish_dirty_bytes_to_legacy_backing(uint64_t line_add
   if (legacy_maintenance_memory_ == nullptr || legacy_maintenance_vm_ == nullptr)
     throw util::ConfigError("L2 cache has no legacy maintenance backing");
 
-  std::optional<GpuVmAccess> vm_access;
+  std::shared_ptr<const GpuVmAccess> vm_access;
   if (vmid != 0) {
-    vm_access = legacy_maintenance_vm_->snapshot_vmid(vmid);
+    vm_access = legacy_maintenance_vm_->cached_access_vmid(vmid);
     if (!vm_access)
       return VmAccessOutcome::Faulted;
   }
@@ -220,7 +220,7 @@ VmAccessOutcome L2Cache::access_outcome(simdojo::MessageStatus status) {
 bool L2Cache::can_fetch_range(uint64_t addr, uint32_t size, uint32_t vmid) const {
   if (vmid == 0 || gpu_vm_ == nullptr)
     return true;
-  const std::optional<GpuVmAccess> vm_access = gpu_vm_->snapshot_vmid(vmid);
+  const std::shared_ptr<const GpuVmAccess> vm_access = gpu_vm_->cached_access_vmid(vmid);
   return vm_access &&
          vm_access->query_access(addr, size, VmAccessKind::Read) == VmAccessOutcome::Complete;
 }
@@ -246,7 +246,7 @@ VmAccessOutcome L2Cache::send_backing(uint64_t addr, uint8_t *data, uint32_t siz
     }
     if (gpu_vm_ == nullptr)
       return VmAccessOutcome::Unavailable;
-    std::optional<GpuVmAccess> vm_access = gpu_vm_->snapshot_vmid(vmid);
+    std::shared_ptr<const GpuVmAccess> vm_access = gpu_vm_->cached_access_vmid(vmid);
     if (!vm_access)
       return VmAccessOutcome::Faulted;
     const VmAccessOutcome outcome =
