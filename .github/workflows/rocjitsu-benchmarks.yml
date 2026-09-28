@@ -17,7 +17,7 @@ defaults:
     shell: bash
 
 env:
-  CORPUS_SHA: e1bac822f3fd2e8c29e3a08ae6c326db1692a757 # rocjitsu-test-corpus#44
+  CORPUS_SHA: 36c47abc18960be58699efba05ebdc8a99fff41c # Default runner CPU affinity
   ROCJITSU_SOURCE_DIR: ${{ github.workspace }}/rocm-systems/emulation/rocjitsu
   CORPUS_SOURCE_DIR: ${{ github.workspace }}/rocjitsu-test-corpus
   RESULTS_BRANCH: gh-pages-rocjitsu
@@ -60,7 +60,8 @@ jobs:
             git \
             libclang-rt-dev \
             libdrm-dev \
-            ninja-build
+            ninja-build \
+            util-linux
 
       - name: Checkout rocm-systems
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
