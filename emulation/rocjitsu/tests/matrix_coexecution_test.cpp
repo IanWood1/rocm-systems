@@ -28,6 +28,7 @@
 #include <array>
 #include <barrier>
 #include <bit>
+#include <chrono>
 #include <memory>
 #include <semaphore>
 #include <stdexcept>
@@ -431,6 +432,80 @@ TEST(AsyncInstructionQueueTest, InterleavedMemoryMmaAndRegisterReuseMatchSerial)
   const auto offloads = amdgpu::async_execution::stats.mma - submitted;
   EXPECT_EQ(amdgpu::async_execution::stats.retired_mma - retired, offloads);
   EXPECT_GT(offloads, 0u);
+}
+
+TEST(MatrixCoexecutionTest, HelperPublishesPayloadAndCompletionAcrossIdleHandoffs) {
+  struct Context {
+    unsigned input = 0;
+    unsigned output = 0;
+    std::thread::id executor;
+  } context;
+  Instruction instruction("copy", [](Instruction &, void *opaque) {
+    auto &ctx = *static_cast<Context *>(opaque);
+    // Give the issuer an opportunity to leave its completion spin loop.
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+    ctx.output = ctx.input ^ 0x5a5a5a5au;
+    ctx.executor = std::this_thread::get_id();
+  });
+  mc::Helper helper;
+  for (unsigned iteration = 1; iteration != 257; ++iteration) {
+    SCOPED_TRACE(iteration);
+    // Exercise publication after the helper has had time to block while idle.
+    // Scheduling is not deterministic: this is handoff stress, not a forced
+    // reproduction of a particular lost-wakeup interleaving.
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+    context.input = iteration;
+    context.output = 0;
+    context.executor = {};
+    helper.submit(instruction, &context);
+    ASSERT_FALSE(helper.wait());
+    EXPECT_TRUE(helper.ready());
+    EXPECT_EQ(context.output, iteration ^ 0x5a5a5a5au);
+    EXPECT_NE(context.executor, std::this_thread::get_id());
+  }
+}
+
+TEST(MatrixCoexecutionTest, HelperRapidReusePublishesNewInstructionAndContext) {
+  struct Context {
+    unsigned input = 0;
+    unsigned output = 0;
+  };
+  std::array<Context, 2> contexts;
+  auto execute = [](Instruction &self, void *opaque) {
+    auto &ctx = *static_cast<Context *>(opaque);
+    ctx.output = ctx.input + self.src_loc();
+  };
+  Instruction first("first", execute, 17);
+  Instruction second("second", execute, 29);
+  std::array<Instruction *, 2> instructions{&first, &second};
+  mc::Helper helper;
+  for (unsigned iteration = 1; iteration != 10001; ++iteration) {
+    auto &context = contexts[iteration % contexts.size()];
+    auto &instruction = *instructions[iteration % instructions.size()];
+    context.input = iteration;
+    context.output = 0;
+    helper.submit(instruction, &context);
+    ASSERT_FALSE(helper.wait());
+    ASSERT_EQ(context.output, iteration + instruction.src_loc()) << iteration;
+  }
+}
+
+TEST(MatrixCoexecutionTest, HelperShutdownWakesIdleWorkersBeforeAndAfterJobs) {
+  unsigned completed = 0;
+  Instruction instruction("increment", [](Instruction &, void *opaque) {
+    ++*static_cast<unsigned *>(opaque);
+  });
+  for (unsigned iteration = 0; iteration != 64; ++iteration) {
+    mc::Helper helper;
+    if (iteration % 2 != 0) {
+      helper.submit(instruction, &completed);
+      ASSERT_FALSE(helper.wait());
+    }
+    // Destruction must wake a helper that has never worked, as well as one
+    // that returned to its idle wait after publishing completion.
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
+  EXPECT_EQ(completed, 32u);
 }
 
 TEST(MatrixCoexecutionTest, SharedPoolDoesNotWaitForBusyHelpersAndReusesThemAcrossIssuers) {
